@@ -14,7 +14,7 @@ to set defaults for container PUTs. For example, after the sequence
     PUT /v1/acct/foo/o1
 
     PUT /v1/acct/foo/o2
-    X-Default-Object-X-Delete-After: 3600
+    X-Delete-After: 3600
 
     PUT /v1/acct/bar/o
 
