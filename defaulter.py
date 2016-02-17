@@ -52,6 +52,15 @@ from swift.proxy.controllers.base import get_account_info
 from swift.proxy.controllers.base import get_container_info
 
 
+BLACKLIST = set('x-timestamp')
+BLACKLIST_PREFIXES = (
+    get_sys_meta_prefix('account'),
+    get_sys_meta_prefix('container'),
+    get_sys_meta_prefix('object'),
+    'x-backend-',
+)
+
+
 class DefaulterMiddleware(object):
     def __init__(self, app, config):
         self.app = app
@@ -105,10 +114,15 @@ class DefaulterMiddleware(object):
                 for subresource in subresources:
                     prefix = header_format % subresource
                     if header.lower().startswith(prefix):
+                        header_to_default = header[len(prefix):].lower()
+                        if header_to_default.startswith(BLACKLIST_PREFIXES):
+                            continue
+                        if header_to_default in BLACKLIST:
+                            continue
                         sysmeta_header = '%sdefault-%s-%s' % (
                             get_sys_meta_prefix(req_type),
                             subresource,
-                            header[len(prefix):])
+                            header_to_default)
                         req.headers[sysmeta_header] = '' if clear else value
 
         return self.get_response_and_translate(req, req_type)
@@ -145,6 +159,11 @@ class DefaulterMiddleware(object):
         for src in (self.conf, acct_sysmeta, cont_sysmeta):
             for key, value in src.items():
                 if key.lower().startswith(prefix):
+                    header_to_default = key[len(prefix):].lower()
+                    if header_to_default.startswith(BLACKLIST_PREFIXES):
+                        continue
+                    if header_to_default in BLACKLIST:
+                        continue
                     if self.conf['use_formatting']:
                         try:
                             value = value.format(**format_args)
@@ -152,7 +171,7 @@ class DefaulterMiddleware(object):
                             # This user may not have specified the default;
                             # don't fail because of someone else
                             pass
-                    defaults[key[len(prefix):]] = value
+                    defaults[header_to_default] = value
         return defaults
 
 
