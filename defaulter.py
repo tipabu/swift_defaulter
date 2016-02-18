@@ -267,8 +267,12 @@ def filter_factory(global_conf, **local_conf):
     conf.update(local_conf)
     conf['use_formatting'] = config_true_value(conf.get(
         'use_formatting', False))
-
-    register_swift_info('defaulter', **conf)
+    defaulting_prefixes = tuple('default-%s-' % typ
+                                for typ in ('account', 'container', 'object'))
+    conf_to_register = {
+        k: v for k, v in conf.items()
+        if k == 'use_formatting' or k.startswith(defaulting_prefixes)}
+    register_swift_info('defaulter', **conf_to_register)
 
     def filt(app):
         return DefaulterMiddleware(app, conf)
