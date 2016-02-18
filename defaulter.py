@@ -1,48 +1,100 @@
 """
 Middleware to set default headers for PUT requests.
 
-Users can POST X-Default-Object-* headers to accounts and containers to set
-default headers for object PUTs, or X-Default-Container-* headers to accounts
-to set defaults for container PUTs. For example, after the sequence
+End Users  / Application Developers
+===================================
 
-    POST /v1/acct
-    X-Default-Object-X-Delete-After: 2592000
+With this middleware enabled, users can set X-Default-Object-* headers on
+accounts and containers to automatically set default headers for subsequent
+object PUTs, or X-Default-Container-* headers on accounts to set defaults for
+subsequent container PUTs. If a default is specified at multiple levels (for
+example, an object default is specified both at the account and container),
+the more-specific level's default is used. For example, in the sequence::
 
-    POST /v1/acct/foo
-    X-Default-Object-X-Delete-After: 86400
+   POST /v1/acct
+   X-Default-Object-X-Delete-After: 2592000
 
-    PUT /v1/acct/foo/o1
+   POST /v1/acct/foo
+   X-Default-Object-X-Delete-After: 86400
 
-    PUT /v1/acct/foo/o2
-    X-Delete-After: 3600
+   PUT /v1/acct/foo/o1
 
-    PUT /v1/acct/bar/o
+   PUT /v1/acct/foo/o2
+   X-Delete-After: 3600
 
-    PUT /v1/acct/baz/o
+   PUT /v1/acct/bar/o3
 
-    POST /v1/acct/baz/o
-    X-Remove-Delete-At: 1
+   PUT /v1/acct/baz/o4
 
-    PUT /v1/other_acct/quux/o
+   POST /v1/acct/baz/o4
+   X-Remove-Delete-At: 1
 
-... acct/foo/o1 will automatically be deleted after 24 hours, acct/foo/o2 will
-automatically be deleted after one hour, and acct/bar/o will be deleted after
-30 days. Of course, other_acct/quux/o will not be automatically deleted, and
-none of this prevents you from later changing or (as with acct/baz/o) removing
-the default header.
+   PUT /v1/other_acct/quux/o5
 
-Configuration options:
-    ``use_formatting``
-        If true, expose {account}, {container}, and {object} formatting
-        variables. This can be useful for example, for setting
-        X-Default-Container-X-Versions-Location: .{container}_versions
-        Default: False
-    ``default-account-*``
-    ``default-container-*``
-    ``default-object-*``
-        Set defaults across the entire cluster.
+ * ``acct/foo/o1`` will get its ``X-Delete-After`` header from the container
+   default, so it will be automatically be deleted after 24 hours.
+
+ * ``acct/foo/o2`` had its ``X-Delete-After`` header explicitly set by the
+   client, so it will be automatically be deleted after one hour.
+
+ * ``acct/bar/o3`` will get its ``X-Delete-After`` header from the account
+   default, so it will be deleted after 30 days.
+
+ * ``acct/baz/04`` will initially be set to delete after 30 days as well.
+   However, nothing prevents you from later changing or removing the defaulted
+   header. After the subsequent ``POST``, the object will not be automatically
+   deleted.
+
+ * ``other_acct/quux/o5`` will not be automatically deleted, as neither its
+   account nor its container specified a default expiration time.
+
+.. note::
+
+   You may not specify defaults for any X-*-Sysmeta-* or X-Backend-* headers.
+   This is comparable to the behavior of the gatekeeper middleware.
+
+Cluster Operators
+=================
 
 Requires Swift >= 1.12.0
+
+Pipeline Placement
+------------------
+
+This middleware should be placed as far left as possible while still being
+right of Swift's sane-WSGI-environment middlewares. Immediately right of
+``cache`` should be reasonable.
+
+Configuration Options
+---------------------
+
+use_formatting
+   If true, expose {account}, {container}, and {object} formatting
+   variables. This can be useful for things like setting::
+
+      X-Default-Container-X-Versions-Location: .{container}_versions
+
+   Default: False
+
+default-account-*
+default-container-*
+default-object-*
+   Used to set defaults across the entire cluster. These have lower precedence
+   than account-level defaults.
+
+Middleware Developers
+=====================
+
+This middleware adds two keys to the request environment:
+
+swift.defaulter_headers
+   This is a comma-delimited list of the headers for which this middleware has
+   set default values. Note that other middlewares may have modified some or
+   all of these after the defaults were set.
+
+swift.defaulter_hook
+   This is a callback that may be used to populate defaults for subrequests.
+   It will only modify PUT requests. It accepts a swob.Request as an argument.
 """
 from swift.common.request_helpers import get_sys_meta_prefix
 from swift.common.swob import wsgify
@@ -59,6 +111,8 @@ BLACKLIST_PREFIXES = (
     get_sys_meta_prefix('object'),
     'x-backend-',
 )
+CALLBACK_ENV_KEY = 'swift.defaulter_hook'
+HEADERS_ENV_KEY = 'swift.defaulter_headers'
 
 
 class DefaulterMiddleware(object):
@@ -68,6 +122,8 @@ class DefaulterMiddleware(object):
 
     @wsgify
     def __call__(self, req):
+        req.environ[CALLBACK_ENV_KEY] = self.defaulter_hook
+
         try:
             vers, acct, cont, obj = req.split_path(2, 4, True)
         except ValueError:
@@ -87,19 +143,7 @@ class DefaulterMiddleware(object):
 
         return handler(req, req_type)
 
-    def get_response_and_translate(self, req, req_type):
-        resp = req.get_response(self.app)
-        prefix = get_sys_meta_prefix(req_type) + 'default-'
-        for header, value in resp.headers.items():
-            if header.lower().startswith(prefix):
-                client_header = 'x-default-%s' % header[len(prefix):]
-                resp.headers[client_header] = value
-        return resp
-
-    def do_post(self, req, req_type):
-        if req_type == 'object':
-            return self.get_response_and_translate(req, req_type)
-
+    def client_to_sysmeta(self, req, req_type):
         subresources = {
             'account': ('container', 'object'),
             'container': ('object', ),
@@ -125,25 +169,67 @@ class DefaulterMiddleware(object):
                             header_to_default)
                         req.headers[sysmeta_header] = '' if clear else value
 
+    def sysmeta_to_client(self, resp, req_type):
+        prefix = get_sys_meta_prefix(req_type) + 'default-'
+        for header, value in resp.headers.items():
+            if header.lower().startswith(prefix):
+                client_header = 'x-default-%s' % header[len(prefix):]
+                resp.headers[client_header] = value
+
+    def get_response_and_translate(self, req, req_type):
+        resp = req.get_response(self.app)
+        self.sysmeta_to_client(resp, req_type)
+        return resp
+
+    def do_post(self, req, req_type):
+        if req_type == 'object':
+            return self.get_response_and_translate(req, req_type)
+        self.client_to_sysmeta(req, req_type)
         return self.get_response_and_translate(req, req_type)
 
-    # TODO: consider adding a copy hook for COPY and versioning
-    def do_put(self, req, req_type):
-        # We've already done this once, so we know we'll succeed
-        vers, acct, cont, obj = req.split_path(2, 4, True)
+    def defaulter_hook(self, req):
+        '''Callback so middlewares that make subrequests can populate defaults.
+
+        :param req: the swob.Request that should have its headers defaulted
+        '''
+        if HEADERS_ENV_KEY in req.environ:
+            return  # We've already tried setting defaults; pass
+
+        if req.method != 'PUT':
+            return  # Only set defaults during PUTs
+
+        try:
+            pieces = req.split_path(2, 4, True)
+        except ValueError:
+            return  # /info, or something? but it's a put... what?
+        if pieces.pop(0) != 'v1':
+            return  # Swift3 request, maybe? Doesn't look like Swift API
+
+        # OK, we're reasonably assured that we're working with an account,
+        # container or object request for which we should populate defaults.
+
         format_args = {}
-        if acct is not None:
-            format_args['account'] = acct
+        for val, val_type in zip(pieces, ('account', 'container', 'object')):
+            if val is not None:
+                format_args[val_type] = val
+                req_type = val_type
 
-        if cont is not None:
-            format_args['container'] = cont
+        defaulted = []
+        for header, value in self.get_defaults(
+                req, req_type, format_args).items():
+            if header not in req.headers:
+                defaulted.append(header)
+                req.headers[header] = value
+        req.environ[HEADERS_ENV_KEY] = ','.join(defaulted)
 
-        if obj is not None:
-            format_args['object'] = obj
+        # Go ahead and translate to sysmeta; it allows users to set things like
+        #    X-Default-Container-X-Default-Object-X-Object-Meta-Color: blue
+        # on their account (if they really want to) and it will Just Work.
+        self.client_to_sysmeta(req, req_type)
 
-        for key, val in self.get_defaults(req, req_type, format_args).items():
-            req.headers.setdefault(key, val)
-
+    # TODO: consider adding a copy hook for COPY
+    def do_put(self, req, req_type):
+        self.defaulter_hook(req)
         # Once we've set the defaults, we just follow the POST flow
         return self.do_post(req, req_type)
 
@@ -158,20 +244,21 @@ class DefaulterMiddleware(object):
         prefix = 'default-%s-' % req_type
         for src in (self.conf, acct_sysmeta, cont_sysmeta):
             for key, value in src.items():
-                if key.lower().startswith(prefix):
-                    header_to_default = key[len(prefix):].lower()
-                    if header_to_default.startswith(BLACKLIST_PREFIXES):
-                        continue
-                    if header_to_default in BLACKLIST:
-                        continue
-                    if self.conf['use_formatting']:
-                        try:
-                            value = value.format(**format_args)
-                        except KeyError:
-                            # This user may not have specified the default;
-                            # don't fail because of someone else
-                            pass
-                    defaults[header_to_default] = value
+                if not key.lower().startswith(prefix):
+                    continue
+                header_to_default = key[len(prefix):].lower()
+                if header_to_default.startswith(BLACKLIST_PREFIXES):
+                    continue
+                if header_to_default in BLACKLIST:
+                    continue
+                if self.conf['use_formatting']:
+                    try:
+                        value = value.format(**format_args)
+                    except KeyError:
+                        # This user may not have specified the default;
+                        # don't fail because of someone else
+                        pass
+                defaults[header_to_default] = value
         return defaults
 
 
