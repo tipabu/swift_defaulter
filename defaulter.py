@@ -150,8 +150,8 @@ class DefaulterMiddleware(object):
         }.get(req_type, ())
 
         header_formats = (
-            ('x-default-%s-', False),
             ('x-remove-default-%s-', True),
+            ('x-default-%s-', False),
         )
         for header_format, clear in header_formats:
             for header, value in req.headers.items():
