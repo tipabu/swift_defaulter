@@ -123,6 +123,8 @@ class DefaulterMiddleware(object):
     @wsgify
     def __call__(self, req):
         req.environ[CALLBACK_ENV_KEY] = self.defaulter_hook
+        req.environ['swift.copy_hook'] = self.copy_hook(req.environ.get(
+            'swift.copy_hook', lambda src_req, src_resp, sink_req: src_resp))
 
         try:
             vers, acct, cont, obj = req.split_path(2, 4, True)
@@ -227,7 +229,14 @@ class DefaulterMiddleware(object):
         # on their account (if they really want to) and it will Just Work.
         self.client_to_sysmeta(req, req_type)
 
-    # TODO: consider adding a copy hook for COPY
+    def copy_hook(self, inner_hook):
+        def outer_hook(src_req, src_resp, sink_req):
+            src_resp = inner_hook(src_req, src_resp, sink_req)
+            if 'swift.post_as_copy' not in src_req.environ:
+                self.defaulter_hook(sink_req)
+            return src_resp
+        return outer_hook
+
     def do_put(self, req, req_type):
         self.defaulter_hook(req)
         # Once we've set the defaults, we just follow the POST flow
